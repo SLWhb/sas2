@@ -5079,3 +5079,587 @@ ALTER TRIGGER "ODS"."TRG_PKK_PERSON_COLLAPSED" ENABLE;
 			ON wor.OBJECTS_ID=per.OBJECTS_ID
     --WHERE wor.OBJECTS_ID=22477470
     ORDER BY wor.WORKS_RANK;
+	
+"
+  CREATE OR REPLACE TYPE "SNAUSER"."MSG_PKK" AS object(
+    msg_Id VARCHAR2(40),
+    msg_date DATE,
+    request_id NUMBER,
+    old_status_id  NUMBER,
+    v_new_status_id NUMBER);
+"
+"
+  CREATE OR REPLACE PACKAGE "SFF"."SNAFRAUD" IS
+	PROCEDURE FRAUD_RULE_M01(v_request_id IN NUMBER, fraud_flag OUT NUMBER);
+END SNAFRAUD;
+CREATE OR REPLACE PACKAGE BODY "SFF"."SNAFRAUD" IS
+  --Процедура для првоерки фрод правила Телефон1-Псп0
+  PROCEDURE FRAUD_RULE_M01(v_request_id IN NUMBER, fraud_flag OUT NUMBER)
+  IS
+-- ========================================================================
+-- ==	ПРОЦЕДУРА "ФРОД-ПРАВИЛО -- Телефон1-Псп0"
+-- ==	ОПИСАНИЕ:		Совпадает личный телефон
+-- ==					, отличается паспорт и хотя бы 1 из параметров: Дата рождения или ФИО, за последние 90 дней. 
+-- ==					(МОБ ТЕЛ =, ПАСП ^= и (ДР^= или ФИО^=) за 90 дней) 
+-- ==         Правка 07.09.2015: добавлены фильтры для телефонов
+-- ========================================================================
+-- ==	СОЗДАНИЕ:		02.02.2016 (ТРАХАЧЕВ В.В.)
+-- ==	МОДИФИКАЦИЯ:	02.02.2016 (ТРАХАЧЕВ В.В.)
+-- ========================================================================
+
+  CURSOR get_fraud(in_RID NUMBER) IS
+    SELECT * FROM 
+			(SELECT sysdate as FROD_RULE_DATE
+				,SRC.REQUEST_ID
+				,SRC.PERSON_ID
+				,SRC.REQ_DATE
+				,SRC.FIO as FIO
+				,SRC.DR as DR
+				,C_R.STATUS_ID
+				,C_R.SCORE_TREE_ROUTE_ID
+				,C_R.CREATED_GROUP_ID
+				-- при необходимости переобзоначить Тип связи и его описание для сработавшего правила
+				,'Телефон1-Псп0' as TYPE_REL
+				,'Совпадает личный телефон, отличается паспорт и хотя бы 1 из параметров: Дата рождения или ФИО, за последние 90 дней.' as TYPE_REL_DESC
+				,ABS(ROUND(SRC.REQ_DATE-APP.REQ_DATE, 0)) as DAY_BETWEEN
+				,LISTAGG(TO_CHAR(APP.REQUEST_ID),',') WITHIN GROUP (ORDER BY SRC.REQUEST_ID,APP.PERSON_ID) 
+															OVER(PARTITION BY SRC.REQUEST_ID,APP.PERSON_ID) REQUEST_ID_REL
+				,APP.PERSON_ID PERSON_ID_REL
+				,APP.REQ_DATE AS REQ_DATE_REL
+				,APP.FIO as FIO_REL, APP.DR as DR_REL
+				,C_R_REL.STATUS_ID as STATUS_ID_REL
+				--,C_R_REL.SCORE_TREE_ROUTE_ID as SCORE_TREE_ROUTE_ID_REL
+				--,C_R_REL.CREATED_GROUP_ID as CREATED_GROUP_ID_REL
+        , NULL as SCORE_TREE_ROUTE_ID_REL
+        , NULL as CREATED_GROUP_ID_REL
+				--INFO: для каждого правила переобозначить инфу в колонках INFO_EQ, INFO_NEQ, INFO_NEQ_REL
+				,'Тел.моб:'||TO_CHAR(SRC.MOBILE) as INFO_EQ
+				,'Фио+Др.:'||SRC.FIO||' '||SRC.DR as INFO_NEQ
+				,'Фио+Др.:'||APP.FIO||' '||APP.DR as INFO_NEQ_REL
+				,ROW_NUMBER() OVER(PARTITION BY SRC.REQUEST_ID,APP.PERSON_ID 
+										ORDER BY SRC.REQUEST_ID,APP.PERSON_ID DESC, APP.REQ_DATE DESC) as F_POS
+			FROM APPLICATIONS_FROD SRC
+			INNER JOIN APPLICATIONS_FROD APP --таблица поиска связей
+				ON --RULE: определяем фрод-правило поиска 
+					SRC.MOBILE = APP.MOBILE
+						AND SRC.PASSPORT^=APP.PASSPORT 
+						AND (SRC.FIO^=APP.FIO OR SRC.DR^=APP.DR)
+						AND APP.REQ_DATE BETWEEN SRC.REQ_DATE-91*1 AND SRC.REQ_DATE
+						AND APP.REQUEST_ID<SRC.REQUEST_ID
+			LEFT OUTER JOIN KREDIT.C_REQUEST@DBLINK_PKK C_R -- доп. информация для целевого физика
+				ON SRC.REQUEST_ID=C_R.REQUEST_ID
+			LEFT OUTER JOIN KREDIT.C_REQUEST@DBLINK_PKK C_R_REL -- доп. информация для привязавшихся физиков
+				ON APP.REQUEST_ID=C_R_REL.REQUEST_ID
+			WHERE SRC.REQUEST_ID=in_RID
+				--EXCEPT: определяем доп. исключения по фрод-правилу (исключение пустых, разные физики и т.п.)
+				AND NOT SRC.MOBILE IS NULL AND SRC.MOBILE>0
+				AND NOT SRC.PASSPORT='-'AND NOT SRC.PASSPORT IS NULL AND NOT APP.PASSPORT='-'AND NOT APP.PASSPORT IS NULL 
+        AND NOT SRC.FIO IS NULL AND NOT APP.FIO IS NULL AND NOT SRC.FIO='-' AND NOT APP.FIO='-'
+        AND NOT SRC.DR='-' AND NOT SRC.DR IS NULL
+        AND NOT MOD(SRC.MOBILE, 1000000)=0 AND NOT TO_CHAR(SRC.MOBILE) LIKE '%999999%'
+				--AND utl_match.edit_distance(SRC.FIO, APP.FIO)+utl_match.edit_distance(SRC.DR, APP.DR)>1
+        --если нужно будет удалить подобных
+			) TAB
+		WHERE TAB.F_POS=1 
+      --исключаем девичьи фамилии
+      AND NOT (SUBSTR(FIO, INSTR(FIO,' '), 254 )=SUBSTR(FIO_REL, INSTR(FIO_REL,' '), 254 ) AND DR=DR_REL )
+      -- исключение однофамильцев 
+			AND NOT UTL_MATCH.EDIT_DISTANCE(SUBSTR(FIO, 1, INSTR(FIO,' ')-1 ), SUBSTR(FIO_REL, 1, INSTR(FIO_REL,' ')-1 ))<3
+			--PostCheck: Модифицированная проверка на родственников
+      AND NOT SFF.FN_IS_FAMILY_REL(TAB.PERSON_ID, TAB.PERSON_ID_REL)=1
+      AND NOT SFF.FN_IS_FAMILY_CONT(TAB.PERSON_ID, TAB.PERSON_ID_REL)=1 
+      AND NOT SFF.FN_IS_FAMILY_CONT(TAB.PERSON_ID_REL, TAB.PERSON_ID)=1
+      --TYPE_REL IN('Телефон1-Псп0' , 'Яма_5' , 'Яма_6')
+      AND EXISTS(SELECT * FROM CPD.PHONES@DBLINK_PKK 
+                        WHERE (OBJECTS_ID=TAB.PERSON_ID OR OBJECTS_ID=TAB.PERSON_ID_REL ) AND OBJECTS_TYPE=2 
+                            AND PHONE=SUBSTR(TAB.INFO_EQ, 9, 10)
+                            AND PHONES_COMM = 'Телефон из РБО: Мобильный');
+
+  in_fraud get_fraud%ROWTYPE;
+
+BEGIN   
+  DBMS_OUTPUT.ENABLE;
+  OPEN get_fraud(v_request_id);
+	LOOP 
+    FETCH get_fraud INTO in_fraud;
+		EXIT WHEN get_fraud%NOTFOUND;
+
+    IF (fraud_flag IS NULL) THEN 
+      --фрод найден, возвращаем 1
+      fraud_flag := 1;   
+    END IF; 
+    
+    INSERT INTO SFF.FROD_RULE_DEMO1(FROD_RULE_DATE, REQUEST_ID, PERSON_ID, REQ_DATE,
+               FIO, DR, STATUS_ID, SCORE_TREE_ROUTE_ID, CREATED_GROUP_ID,
+               TYPE_REL, TYPE_REL_DESC, DAY_BETWEEN,
+               REQUEST_ID_REL, PERSON_ID_REL, REQ_DATE_REL,
+               FIO_REL, DR_REL, STATUS_ID_REL, SCORE_TREE_ROUTE_ID_REL, CREATED_GROUP_ID_REL,
+               INFO_EQ, INFO_NEQ, INFO_NEQ_REL, F_POS)
+       VALUES(
+       in_fraud.FROD_RULE_DATE, in_fraud.REQUEST_ID, in_fraud.PERSON_ID, in_fraud.REQ_DATE,
+               in_fraud.FIO, in_fraud.DR, in_fraud.STATUS_ID, in_fraud.SCORE_TREE_ROUTE_ID, in_fraud.CREATED_GROUP_ID,
+               in_fraud.TYPE_REL, in_fraud.TYPE_REL_DESC, in_fraud.DAY_BETWEEN,
+               in_fraud.REQUEST_ID_REL, in_fraud.PERSON_ID_REL, in_fraud.REQ_DATE_REL,
+               in_fraud.FIO_REL, in_fraud.DR_REL, in_fraud.STATUS_ID_REL, in_fraud.SCORE_TREE_ROUTE_ID_REL, in_fraud.CREATED_GROUP_ID_REL,
+               in_fraud.INFO_EQ, in_fraud.INFO_NEQ, in_fraud.INFO_NEQ_REL, in_fraud.F_POS);
+  END LOOP;
+
+  IF (fraud_flag IS NULL) THEN fraud_flag := 0;
+  END IF;
+  CLOSE get_fraud;
+  
+  EXCEPTION
+    WHEN OTHERS
+    THEN fraud_flag := -1;
+  END FRAUD_RULE_M01;
+  
+END SNAFRAUD;"
+"
+  CREATE OR REPLACE PACKAGE "ODS"."UPD_PKK" IS
+	PROCEDURE PR$UPD_PKK_ADDRESS;
+  PROCEDURE PR$UPD_PKK_ADDRESS_HISTORY;
+  PROCEDURE PR$UPD_PKK_C_CREDIT_INFO;
+  PROCEDURE PR$UPD_PKK_C_REQUEST_SNA;
+  PROCEDURE PR$UPD_PKK_CONTACTS;
+  PROCEDURE PR$UPD_PKK_DOCUMENTS_HISTORY;
+  PROCEDURE PR$UPD_PKK_EMAIL;
+  PROCEDURE PR$UPD_PKK_PERSON_INFO;
+  PROCEDURE PR$UPD_PKK_WORKS_INFO;
+--далее обновления по REQUEST_ID (если передается параметр)
+  /*PROCEDURE PR$UPD_PKK_ADDRESS(v_REQUEST_ID NUMBER DEFAULT -999);
+  PROCEDURE PR$UPD_PKK_ADDRESS_HISTORY(v_REQUEST_ID NUMBER DEFAULT -999);
+  PROCEDURE PR$UPD_PKK_C_CREDIT_INFO(v_REQUEST_ID NUMBER DEFAULT -999);
+  PROCEDURE PR$UPD_PKK_C_REQUEST_SNA(v_REQUEST_ID NUMBER DEFAULT -999);
+  PROCEDURE PR$UPD_PKK_CONTACTS(v_REQUEST_ID NUMBER DEFAULT -999);
+  PROCEDURE PR$UPD_PKK_DOCUMENTS_HISTORY(v_REQUEST_ID NUMBER DEFAULT -999);*/
+  PROCEDURE PR$UPD_PKK_EMAIL(v_REQUEST_ID NUMBER DEFAULT -999);
+  /*PROCEDURE PR$UPD_PKK_PERSON_INFO(v_REQUEST_ID NUMBER DEFAULT -999);
+  PROCEDURE PR$UPD_PKK_WORKS_INFO(v_REQUEST_ID NUMBER DEFAULT -999);*/
+END UPD_PKK;
+CREATE OR REPLACE PACKAGE BODY "ODS"."UPD_PKK" IS
+  PROCEDURE     "PR$UPD_PKK_EMAIL"
+  -- ========================================================================
+  -- ==	ПРОЦЕДУРА    Обновление таблицы EMAIL
+  -- ==	ОПИСАНИЕ:	   История Емайл адресов
+  -- ========================================================================
+  -- ==	СОЗДАНИЕ:		  31.12.2015 (ТРАХАЧЕВ В.В.)
+  -- ==	МОДИФИКАЦИЯ:	11.02.2016 (ТРАХАЧЕВ В.В.)
+  /*PKK_EMAIL:20.01.16 23:18:06-11.02.16 04:30:43(13268). От 10.02.16 22:31:39,765712000 UTC до 11.02.16 01:32:27
+    PKK_EMAIL:10.02.16 20:30:43-11.02.16 04:30:43(222). От 10.02.16 22:45:05,482114000 UTC до 11.02.16 01:45:06
+    
+  */
+  -- ========================================================================
+  AS    
+    last_DT_SFF DATE; -- последний MODIFICATION_DATE в SFF
+    last_DT_PKK DATE; -- последний MODIFICATION_DATE в ПКК
+    
+    --v_OBJECTS_ID NUMBER := -999;
+    f_Exist_REQUEST_ID NUMBER;
+    
+    start_time VARCHAR2(60);
+    cnt_MODIF NUMBER;
+  BEGIN
+    DBMS_OUTPUT.ENABLE;  
+    start_time := TO_CHAR(systimestamp at time zone 'utc');
+    
+    /*IF v_REQUEST_ID^=-999 THEN --если параметр передали, ищем нужный OBJECTS_ID
+      SELECT COUNT(*) INTO f_Exist_REQUEST_ID FROM dual 
+        WHERE EXISTS(SELECT OBJECTS_ID FROM KREDIT.C_REQUEST@DBLINK_PKK WHERE REQUEST_ID = v_REQUEST_ID);
+      IF f_Exist_REQUEST_ID=1 THEN 
+        SELECT NVL(OBJECTS_ID, -999) INTO v_OBJECTS_ID FROM KREDIT.C_REQUEST@DBLINK_PKK WHERE REQUEST_ID = v_REQUEST_ID;
+      END IF;
+    END IF;*/
+  
+    SELECT MAX(EMAIL_CREATED)-8/24 INTO last_DT_SFF FROM ODS.PKK_EMAIL
+        WHERE EMAIL_ID>=(SELECT MAX(EMAIL_ID)-1000 FROM ODS.PKK_EMAIL);
+    --ОБНОВЛЕНИЕ
+    MERGE INTO ODS.PKK_EMAIL tar
+    USING (SELECT
+      em.EMAIL_ID
+      ,em.OBJECTS_ID
+      ,em.OBJECTS_TYPE
+      ,em.EMAIL
+      ,em.EMAIL_AKT
+      ,em.EMAIL_CREATED
+      ,em.CREATED_SOURCE
+      ,em.CREATED_USER_ID
+      ,em.CREATED_GROUP_ID
+      ,em.CREATED_IPADR
+      ,em.MODIFICATION_DATE
+    FROM CPD.EMAIL@dblink_pkk em
+    WHERE 
+        --Добавление 100 дней - 4 минуты на одном индексе.
+        --вариант с обновлением по частям
+        COALESCE(MODIFICATION_DATE, EMAIL_CREATED)>last_DT_SFF
+        ) src
+      ON (src.EMAIL_ID = tar.EMAIL_ID )
+    WHEN MATCHED THEN
+      --Обновляем существующее (клюевые и неизменяемые поля не нужно обновлять )
+      UPDATE SET
+          --tar.EMAIL_ID=src.EMAIL_ID
+          tar.OBJECTS_ID=src.OBJECTS_ID
+          /*,tar.OBJECTS_TYPE=src.OBJECTS_TYPE*/
+          ,tar.EMAIL_AKT=src.EMAIL_AKT
+          /*,tar.EMAIL_CREATED=src.EMAIL_CREATED
+          ,tar.CREATED_SOURCE=src.CREATED_SOURCE
+          ,tar.CREATED_USER_ID=src.CREATED_USER_ID
+          ,tar.CREATED_GROUP_ID=src.CREATED_GROUP_ID
+          ,tar.CREATED_IPADR=src.CREATED_IPADR*/
+          ,tar.MODIFICATION_DATE=src.MODIFICATION_DATE
+          /*,tar.MODIFICATION_SOURCE=src.MODIFICATION_SOURCE
+          ,tar.MODIFICATION_USER_ID=src.MODIFICATION_USER_ID
+          ,tar.MODIFICATION_GROUP_ID=src.MODIFICATION_GROUP_ID
+          ,tar.MODIFICATION_IPADR=src.MODIFICATION_IPADR*/
+          ,tar.DATE_UPD=SYSDATE
+    WHEN NOT MATCHED THEN 
+    --вставляем новое 
+    INSERT (	tar.EMAIL_ID
+              ,tar.OBJECTS_ID, tar.OBJECTS_TYPE
+              ,tar.EMAIL
+              ,tar.EMAIL_AKT, tar.EMAIL_CREATED
+              ,tar.CREATED_SOURCE, tar.CREATED_USER_ID, tar.CREATED_GROUP_ID, tar.CREATED_IPADR
+              ,tar.MODIFICATION_DATE
+              ,tar.DATE_UPD
+            )
+    VALUES (src.EMAIL_ID
+              ,src.OBJECTS_ID, src.OBJECTS_TYPE
+              ,src.EMAIL
+              ,src.EMAIL_AKT, src.EMAIL_CREATED
+              ,src.CREATED_SOURCE, src.CREATED_USER_ID, src.CREATED_GROUP_ID, src.CREATED_IPADR
+              ,src.MODIFICATION_DATE
+              , SYSDATE)
+    ;	
+    --информация для вывода при ручном обновлении
+    cnt_MODIF := SQL%ROWCOUNT;
+    SELECT MAX(EMAIL_CREATED) INTO last_DT_PKK FROM ODS.PKK_EMAIL
+         WHERE EMAIL_ID>=(SELECT MAX(EMAIL_ID)-1000 FROM ODS.PKK_EMAIL);
+    DBMS_OUTPUT.PUT_LINE('PKK_EMAIL:'||TO_CHAR(last_DT_SFF)||'-'||last_DT_PKK||'('||cnt_MODIF||')'
+                  ||'. От '||start_time||' до '||TO_CHAR(systimestamp at time zone 'utc'));
+  EXCEPTION
+      WHEN OTHERS
+      THEN DBMS_OUTPUT.PUT_LINE('Ошибка выполения процедуры PR$UPD_PKK_EMAIL');
+  END;
+  
+  PROCEDURE     "PR$UPD_PKK_EMAIL"(v_REQUEST_ID NUMBER)
+  -- ========================================================================
+  -- ==	ПРОЦЕДУРА    Обновление таблицы EMAIL
+  -- ==	ОПИСАНИЕ:	   История Емайл адресов
+  -- ========================================================================
+  -- ==	СОЗДАНИЕ:		  31.12.2015 (ТРАХАЧЕВ В.В.)
+  -- ==	МОДИФИКАЦИЯ:	11.02.2016 (ТРАХАЧЕВ В.В.)
+  /*PKK_EMAIL:20.01.16 23:18:06-11.02.16 04:30:43(13268). От 10.02.16 22:31:39,765712000 UTC до 11.02.16 01:32:27
+    PKK_EMAIL:10.02.16 20:30:43-11.02.16 04:30:43(222). От 10.02.16 22:45:05,482114000 UTC до 11.02.16 01:45:06
+    
+  */
+  -- ========================================================================
+  AS    
+    last_DT_SFF DATE; -- последний MODIFICATION_DATE в SFF
+    last_DT_PKK DATE; -- последний MODIFICATION_DATE в ПКК
+    
+    v_OBJECTS_ID NUMBER := -999;
+    f_Exist_REQUEST_ID NUMBER;
+    
+    start_time VARCHAR2(60);
+    cnt_MODIF NUMBER;
+  BEGIN
+    DBMS_OUTPUT.ENABLE;  
+    start_time := TO_CHAR(systimestamp at time zone 'utc');
+    
+    IF v_REQUEST_ID^=-999 THEN --если параметр передали, ищем нужный OBJECTS_ID
+      SELECT COUNT(*) INTO f_Exist_REQUEST_ID FROM dual 
+        WHERE EXISTS(SELECT OBJECTS_ID FROM KREDIT.C_REQUEST@DBLINK_PKK WHERE REQUEST_ID = v_REQUEST_ID);
+      IF f_Exist_REQUEST_ID=1 THEN 
+        SELECT NVL(OBJECTS_ID, -999) INTO v_OBJECTS_ID FROM KREDIT.C_REQUEST@DBLINK_PKK WHERE REQUEST_ID = v_REQUEST_ID;
+      END IF;
+    END IF;
+  
+    SELECT MAX(EMAIL_CREATED)-8/24 INTO last_DT_SFF FROM ODS.PKK_EMAIL
+        WHERE EMAIL_ID>=(SELECT MAX(EMAIL_ID)-1000 FROM ODS.PKK_EMAIL);
+    --ОБНОВЛЕНИЕ
+    MERGE INTO ODS.PKK_EMAIL tar
+    USING (SELECT
+      em.EMAIL_ID
+      ,em.OBJECTS_ID
+      ,em.OBJECTS_TYPE
+      ,em.EMAIL
+      ,em.EMAIL_AKT
+      ,em.EMAIL_CREATED
+      ,em.CREATED_SOURCE
+      ,em.CREATED_USER_ID
+      ,em.CREATED_GROUP_ID
+      ,em.CREATED_IPADR
+      ,em.MODIFICATION_DATE
+    FROM CPD.EMAIL@dblink_pkk em
+    WHERE 
+        --Добавление 100 дней - 4 минуты на одном индексе.
+        --вариант с обновлением по частям
+        OBJECTS_ID = v_OBJECTS_ID
+      ) src
+      ON (src.EMAIL_ID = tar.EMAIL_ID )
+    WHEN MATCHED THEN
+      --Обновляем существующее (клюевые и неизменяемые поля не нужно обновлять )
+      UPDATE SET
+          --tar.EMAIL_ID=src.EMAIL_ID
+          tar.OBJECTS_ID=src.OBJECTS_ID
+          /*,tar.OBJECTS_TYPE=src.OBJECTS_TYPE*/
+          ,tar.EMAIL_AKT=src.EMAIL_AKT
+          /*,tar.EMAIL_CREATED=src.EMAIL_CREATED
+          ,tar.CREATED_SOURCE=src.CREATED_SOURCE
+          ,tar.CREATED_USER_ID=src.CREATED_USER_ID
+          ,tar.CREATED_GROUP_ID=src.CREATED_GROUP_ID
+          ,tar.CREATED_IPADR=src.CREATED_IPADR*/
+          ,tar.MODIFICATION_DATE=src.MODIFICATION_DATE
+          /*,tar.MODIFICATION_SOURCE=src.MODIFICATION_SOURCE
+          ,tar.MODIFICATION_USER_ID=src.MODIFICATION_USER_ID
+          ,tar.MODIFICATION_GROUP_ID=src.MODIFICATION_GROUP_ID
+          ,tar.MODIFICATION_IPADR=src.MODIFICATION_IPADR*/
+          ,tar.DATE_UPD=SYSDATE
+    WHEN NOT MATCHED THEN  
+    --вставляем новое 
+    INSERT (	tar.EMAIL_ID
+              ,tar.OBJECTS_ID, tar.OBJECTS_TYPE
+              ,tar.EMAIL
+              ,tar.EMAIL_AKT, tar.EMAIL_CREATED
+              ,tar.CREATED_SOURCE, tar.CREATED_USER_ID, tar.CREATED_GROUP_ID, tar.CREATED_IPADR
+              ,tar.MODIFICATION_DATE
+              ,tar.DATE_UPD
+            )
+    VALUES (src.EMAIL_ID
+              ,src.OBJECTS_ID, src.OBJECTS_TYPE
+              ,src.EMAIL
+              ,src.EMAIL_AKT, src.EMAIL_CREATED
+              ,src.CREATED_SOURCE, src.CREATED_USER_ID, src.CREATED_GROUP_ID, src.CREATED_IPADR
+              ,src.MODIFICATION_DATE
+              , SYSDATE)
+    ;	
+    --информация для вывода при ручном обновлении
+    cnt_MODIF := SQL%ROWCOUNT;
+    SELECT MAX(EMAIL_CREATED) INTO last_DT_PKK FROM ODS.PKK_EMAIL
+         WHERE EMAIL_ID>=(SELECT MAX(EMAIL_ID)-1000 FROM ODS.PKK_EMAIL);
+    DBMS_OUTPUT.PUT_LINE('PKK_EMAIL:'||TO_CHAR(last_DT_SFF)||'-'||last_DT_PKK||'('||cnt_MODIF||')'
+                  ||'. От '||start_time||' до '||TO_CHAR(systimestamp at time zone 'utc'));
+  EXCEPTION
+      WHEN OTHERS
+      THEN DBMS_OUTPUT.PUT_LINE('Ошибка выполения процедуры PR$UPD_PKK_EMAIL (v_REQUEST_ID)');
+  END;
+   
+  PROCEDURE     "PR$UPD_PKK_ADDRESS"
+  -- ========================================================================
+  -- ==	ПРОЦЕДУРА     Обновление таблицу с данными из C_REQUEST
+  -- ==	ОПИСАНИЕ:	    Обновляем статусов и прочее для заявок
+  -- ========================================================================
+  -- ==	СОЗДАНИЕ:		  09.11.2015 (ТРАХАЧЕВ В.В.)
+  -- ==	МОДИФИКАЦИЯ:	25.01.2016 (ТРАХАЧЕВ В.В.)
+  -- ==
+  /*PKK_ADDRESS:45147121 - 45180956. От :25.01.16 06:01:19,117174000 UTC до: 25.01.16 06:11:52,391406000 UTC
+    PKK_ADDRESS:45179956 - 45181029. От :25.01.16 06:26:27,650414000 UTC до: 25.01.16 06:26:33,475282000 UTC
+    PKK_ADDRESS:45180029 - 45181031. От :25.01.16 06:27:10,728925000 UTC до: 25.01.16 06:27:15,561455000 UTC
+    PKK_ADDRESS:45180031 - 45181041. От  25.01.16 06:31:27,625945000 UTC до  25.01.16 06:31:32,745738000 UTC
+    PKK_ADDRESS:45171041-45223898(52649). От 11.02.16 02:49:31,756795000 UTC до 11.02.16 02:55:52,778584000 UTC
+    PKK_ADDRESS:45223798-45223905(108). От 11.02.16 02:57:32,505665000 UTC до 11.02.16 02:57:35,696665000 UTC
+    PKK_ADDRESS:45222905-45223905(994). От 11.02.16 02:58:04,738978000 UTC до 11.02.16 02:58:09,354902000 UTC
+  */
+  -- ========================================================================
+  AS    
+    last_ID_SFF NUMBER; -- последний существующий REQUEST_ID в SFF
+    last_ID_PKK NUMBER; -- последний существующий REQUEST_ID в ПКК
+    
+    start_time VARCHAR2(60);
+    cnt_MODIF NUMBER;
+  BEGIN
+    DBMS_OUTPUT.ENABLE;  
+    
+    start_time := TO_CHAR(systimestamp at time zone 'utc');
+    
+    SELECT MAX(ADDRESS_ID)-1000 INTO last_ID_SFF FROM ODS.PKK_ADDRESS;
+    SELECT MAX(ADDRESS_ID) INTO last_ID_PKK FROM CPD.ADDRESS@DBLINK_PKK;
+  
+    --ОБНОВЛЕНИЕ
+    MERGE INTO ODS.PKK_ADDRESS tar
+    USING (SELECT
+        adr.ADDRESS_ID
+        ,cntr.COUNTRIES_ISO2 as COUNTRY		--Страна
+        ,adr.REGIONS_UID
+        ,reg.REGIONS_NAMES					--Регион
+        ,adr.AREAS_UID    
+        ,are.AREAS_NAMES					--Район 
+        ,adr.CITIES_UID						--Id нас. пункта
+        ,cit.CITIES_NAMES					--НП
+        ,cit.CITIES_TYPE					--Тип НП ID
+        ,KLADR_SIT.SHOTNAME as SHOTNAME_CIT	--Тип НП 
+        ,adr.STREETS_UID					--ID типа улицы
+        ,str.STREETS_NAMES					--Улица 
+        ,str.STREETS_TYPE					--Тип улицы ID
+        ,KLADR_STR.SHOTNAME as SHOTNAME_STR	--Тип улицы 
+        ,adr.HOUSE							--Дом 
+        ,adr.BUILD							--Корпус 
+        ,adr.FLAT							--Квартира
+        ,adr.POSTOFFICE						--Индекс
+        ,adr.GEO_ID							--ID геоданных
+        ,geo.QUALITY_CODE					--Код качества при преобразовании исходных адресных данных для получения геокоординат
+        ,geo.GEO_LAT						--Широта
+        ,geo.GEO_LNG						--Долгота
+        ,geo.GEO_QC							--Точность определения преобразования адреса для получения координат
+        ,geo.ADDRESS_STR AS GEO_ADR			--Преобразованный адрес, по которому цеплялись координаты
+        ,geo.CREATED_DATE AS GEO_CREATED	--Дата создания кординат
+      FROM CPD.ADDRESS@dblink_pkk adr 
+      LEFT JOIN CPD.REGIONS_NAMES@dblink_pkk reg ON adr.REGIONS_UID = reg.REGIONS_UID
+      LEFT JOIN CPD.AREAS_NAMES@dblink_pkk are ON adr.AREAS_UID = are.AREAS_UID
+      LEFT JOIN CPD.CITIES_NAMES@dblink_pkk cit ON adr.CITIES_UID = cit.CITIES_UID
+      LEFT JOIN CPD.STREETS_NAMES@dblink_pkk str ON adr.STREETS_UID = str.STREETS_UID
+      LEFT JOIN CPD.COUNTRIES@dblink_pkk cntr ON adr.COUNTRIES_ID = cntr.COUNTRIES_ID
+      LEFT JOIN CPD.KLADR_SOCR@dblink_pkk KLADR_SIT ON cit.CITIES_TYPE = KLADR_SIT.SOCR_ID
+      LEFT JOIN CPD.KLADR_SOCR@dblink_pkk KLADR_STR ON str.STREETS_TYPE = KLADR_STR.SOCR_ID
+      LEFT JOIN CPD.GEOCOORDINATES@dblink_pkk geo ON adr.GEO_ID = geo.ID
+      WHERE 
+        adr.ADDRESS_ID BETWEEN last_ID_SFF AND last_ID_PKK
+      ) src
+      ON (src.ADDRESS_ID = tar.ADDRESS_ID )
+    WHEN MATCHED THEN
+      --клюевые и неизменяемые поля не нужно обновлять. 
+      UPDATE SET
+        --tar.ADDRESS_ID=src.ADDRESS_ID
+        tar.COUNTRY=src.COUNTRY
+        ,tar.REGIONS_UID=src.REGIONS_UID
+        ,tar.REGIONS_NAMES=src.REGIONS_NAMES
+        ,tar.AREAS_UID=src.AREAS_UID
+        ,tar.AREAS_NAMES=src.AREAS_NAMES
+        ,tar.CITIES_UID=src.CITIES_UID
+        ,tar.CITIES_NAMES=src.CITIES_NAMES
+        ,tar.CITIES_TYPE=src.CITIES_TYPE
+        ,tar.SHOTNAME_CIT=src.SHOTNAME_CIT
+        ,tar.STREETS_UID=src.STREETS_UID
+        ,tar.STREETS_NAMES=src.STREETS_NAMES
+        ,tar.STREETS_TYPE=src.STREETS_TYPE
+        ,tar.SHOTNAME_STR=src.SHOTNAME_STR
+        ,tar.HOUSE=src.HOUSE
+        ,tar.BUILD=src.BUILD
+        ,tar.FLAT=src.FLAT
+        ,tar.POSTOFFICE=src.POSTOFFICE
+        ,tar.GEO_ID=src.GEO_ID
+        ,tar.QUALITY_CODE=src.QUALITY_CODE
+        ,tar.GEO_LAT=src.GEO_LAT
+        ,tar.GEO_LNG=src.GEO_LNG
+        ,tar.GEO_QC=src.GEO_QC
+        ,tar.GEO_ADR=src.GEO_ADR
+        ,tar.GEO_CREATED=src.GEO_CREATED
+        ,tar.DATE_UPD=SYSDATE
+    WHEN NOT MATCHED THEN 
+    --вставляем новое
+    INSERT (tar.ADDRESS_ID
+        ,tar.COUNTRY
+        ,tar.REGIONS_UID, tar.REGIONS_NAMES, tar.AREAS_UID, tar.AREAS_NAMES
+        ,tar.CITIES_UID, tar.CITIES_NAMES, tar.CITIES_TYPE, tar.SHOTNAME_CIT
+        ,tar.STREETS_UID, tar.STREETS_NAMES, tar.STREETS_TYPE, tar.SHOTNAME_STR
+        ,tar.HOUSE, tar.BUILD, tar.FLAT
+        ,tar.POSTOFFICE
+        ,tar.GEO_ID, tar.QUALITY_CODE, tar.GEO_LAT, tar.GEO_LNG
+        ,tar.GEO_QC, tar.GEO_ADR, tar.GEO_CREATED
+        ,tar.DATE_UPD)
+    VALUES (src.ADDRESS_ID
+        ,src.COUNTRY
+        ,src.REGIONS_UID, src.REGIONS_NAMES, src.AREAS_UID, src.AREAS_NAMES
+        ,src.CITIES_UID, src.CITIES_NAMES, src.CITIES_TYPE, src.SHOTNAME_CIT
+        ,src.STREETS_UID, src.STREETS_NAMES, src.STREETS_TYPE, src.SHOTNAME_STR
+        ,src.HOUSE, src.BUILD, src.FLAT
+        ,src.POSTOFFICE
+        ,src.GEO_ID, src.QUALITY_CODE, src.GEO_LAT, src.GEO_LNG
+        ,src.GEO_QC, src.GEO_ADR, src.GEO_CREATED
+        ,SYSDATE)
+    ;	
+  
+    --информация для вывода при ручном обновлении
+    cnt_MODIF := SQL%ROWCOUNT;
+    
+    DBMS_OUTPUT.PUT_LINE('PKK_ADDRESS:'||TO_CHAR(last_ID_SFF)||'-'||last_ID_PKK||'('||cnt_MODIF||')'
+                  ||'. От '||start_time||' до '||TO_CHAR(systimestamp at time zone 'utc'));
+    
+  EXCEPTION
+      WHEN OTHERS
+      THEN DBMS_OUTPUT.PUT_LINE('Ошибка выполения процедуры PR$UPD_PKK_ADDRESS');
+      
+  END PR$UPD_PKK_ADDRESS;
+  
+  PROCEDURE PR$UPD_PKK_ADDRESS_HISTORY IS
+  BEGIN  
+    NULL;
+  END PR$UPD_PKK_ADDRESS_HISTORY;
+  
+  PROCEDURE PR$UPD_PKK_C_CREDIT_INFO IS
+  BEGIN
+    NULL;
+  END PR$UPD_PKK_C_CREDIT_INFO; 
+  
+  PROCEDURE PR$UPD_PKK_C_REQUEST_SNA IS
+  BEGIN
+    NULL;
+  END PR$UPD_PKK_C_REQUEST_SNA;
+  
+  PROCEDURE PR$UPD_PKK_CONTACTS IS
+  BEGIN
+    NULL;
+  END PR$UPD_PKK_CONTACTS;
+  
+  PROCEDURE PR$UPD_PKK_DOCUMENTS_HISTORY IS
+  BEGIN
+    NULL;
+  END PR$UPD_PKK_DOCUMENTS_HISTORY;
+  
+  PROCEDURE PR$UPD_PKK_PERSON_INFO IS
+  BEGIN
+    NULL;
+  END PR$UPD_PKK_PERSON_INFO;
+  
+  PROCEDURE PR$UPD_PKK_WORKS_INFO IS
+  BEGIN
+    NULL; 
+  END PR$UPD_PKK_WORKS_INFO;
+  
+END UPD_PKK;
+
+  CREATE OR REPLACE TYPE "SNAUSER"."T_SNA_NODE_ROUTE" 
+IS OBJECT (L_SRC_REQUEST_ID NUMBER, 
+	"l_SRC_OBJECTS_ID" NUMBER,
+	"SNA_REQUEST_DATE" DATE, 
+	"USER_SNA" VARCHAR2(100 BYTE), 
+	"DATE_UPD" TIMESTAMP (6), 
+	"OBJECTS_ID" NUMBER, 
+	"OBJECTS_ID_REL" NUMBER, 
+	"ROOT_PERS" NUMBER, 
+	"ROOT_PERS_REL" NUMBER, 
+	"N1" VARCHAR2(300 BYTE), 
+	"T1" VARCHAR2(30 BYTE), 
+	"AKT1" NUMBER, 
+	"DT1" DATE, 
+	"N2" VARCHAR2(300 BYTE), 
+	"T2" VARCHAR2(30 BYTE), 
+	"AKT2" NUMBER, 
+	"DT2" DATE, 
+	"N3" VARCHAR2(400 BYTE), 
+	"T3" VARCHAR2(30 BYTE), 
+	"AKT3" NUMBER, 
+	"DT3" DATE, 
+	"N4" VARCHAR2(500 BYTE), 
+	"T4" VARCHAR2(30 BYTE), 
+	"AKT4" NUMBER, 
+	"DT4" DATE, 
+	"N5" VARCHAR2(300 BYTE), 
+	"T5" VARCHAR2(30 BYTE), 
+	"AKT5" NUMBER, 
+	"DT5" DATE, 
+	"ROUTE_GRAPH" VARCHAR2(100 BYTE), 
+	"ATTRIBUTES" VARCHAR2(1000 BYTE), 
+	"LEVEL_NODE" NUMBER);
+
+  CREATE OR REPLACE TYPE "SNAUSER"."AQ_PKK_SNA_TYPE" AS OBJECT
+(
+  msg_id VARCHAR2(50)
+, msg_date DATE
+, request_id NUMBER
+, objects_id NUMBER
+, score_tree_route_id NUMBER
+, created_group_id NUMBER
+, type_request_id NUMBER
+, old_status_id NUMBER
+, new_status_id NUMBER
+);
